@@ -63,8 +63,8 @@ export default function AdminLayout() {
              <Menu className="h-6 w-6" />
            </button>
         </header>
-        <div className="flex-1 p-6 md:p-8 overflow-y-auto z-0">
-          <div className="max-w-6xl mx-auto animate-fade-in-up">
+        <div className="flex-1 p-6 md:p-8 overflow-y-auto overflow-x-hidden z-0">
+          <div className="max-w-6xl mx-auto min-w-0 animate-fade-in-up">
             <Outlet />
           </div>
         </div>

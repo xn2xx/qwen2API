@@ -1,21 +1,19 @@
+"""
+账号池核心逻辑 - 对齐 ds2api 的 pool_core.go
+"""
 import asyncio
 import logging
-import random
 import time
 from typing import Optional
+
 from backend.core.database import AsyncJsonDB
 from backend.core.config import settings
 
-log = logging.getLogger("qwen2api.accounts")
-
-
-def _jitter_seconds() -> float:
-    low = max(0, settings.REQUEST_JITTER_MIN_MS)
-    high = max(low, settings.REQUEST_JITTER_MAX_MS)
-    return random.uniform(low, high) / 1000.0
+log = logging.getLogger("qwen2api.accounts.core")
 
 
 class Account:
+    """账号对象"""
     def __init__(
         self,
         email="",
@@ -99,18 +97,62 @@ class Account:
 
 
 class AccountPool:
+    """
+    账号池 - 对齐 ds2api 的 4 层并发控制
+
+    4 层限流：
+    1. maxInflightPerAccount: 每账号最大并发
+    2. recommendedConcurrency: 推荐并发值（账号数 × 每账号并发）
+    3. maxQueueSize: 等待队列上限
+    4. globalMaxInflight: 全局最大并发
+    """
+
     def __init__(self, db: AsyncJsonDB, max_inflight: int = settings.MAX_INFLIGHT_PER_ACCOUNT):
         self.db = db
-        self.max_inflight = max_inflight
         self.accounts: list[Account] = []
         self._lock = asyncio.Lock()
-        self._waiters: list[asyncio.Event] = []
+
+        # 4 层并发控制（对齐 ds2api）
+        self.max_inflight_per_account = max_inflight
+        self.recommended_concurrency = 0
+        self.max_queue_size = 0
+        self.global_max_inflight = 0
+
+        # 等待队列（使用 asyncio.Queue 更接近 Go channel）
+        self._waiters_queue: asyncio.Queue = asyncio.Queue()
         self._sticky_email: Optional[str] = None
 
+        # 全局并发计数
+        self.global_in_use = 0
+
     async def load(self):
+        """加载账号并初始化并发参数"""
         data = await self.db.load()
         self.accounts = [Account(**d) for d in data] if isinstance(data, list) else []
+        self._reset_concurrency_limits()
         log.info(f"Loaded {len(self.accounts)} upstream account(s)")
+
+    def _reset_concurrency_limits(self):
+        """重置并发限制 - 对齐 ds2api 的 Reset() 逻辑"""
+        account_count = len([a for a in self.accounts if a.is_available()])
+
+        # 计算推荐并发值（对齐 ds2api）
+        self.recommended_concurrency = account_count * self.max_inflight_per_account
+
+        # 队列上限 = 推荐并发值（可配置）
+        self.max_queue_size = self.recommended_concurrency
+
+        # 全局并发上限 = 推荐并发值（可配置）
+        self.global_max_inflight = self.recommended_concurrency
+
+        log.info(
+            f"[init_account_queue] initialized: "
+            f"total={account_count}, "
+            f"max_inflight_per_account={self.max_inflight_per_account}, "
+            f"global_max_inflight={self.global_max_inflight}, "
+            f"recommended_concurrency={self.recommended_concurrency}, "
+            f"max_queue_size={self.max_queue_size}"
+        )
 
     async def save(self):
         await self.db.save([a.to_dict() for a in self.accounts])
@@ -120,110 +162,42 @@ class AccountPool:
             self.accounts = [a for a in self.accounts if a.email != account.email]
             self.accounts.append(account)
         await self.save()
+        self._reset_concurrency_limits()
 
     async def remove(self, email: str):
         async with self._lock:
             self.accounts = [a for a in self.accounts if a.email != email]
         await self.save()
+        self._reset_concurrency_limits()
 
     def set_max_inflight(self, value: int):
-        self.max_inflight = max(1, int(value))
+        self.max_inflight_per_account = max(1, int(value))
+        self._reset_concurrency_limits()
 
-    async def acquire(self, exclude: set = None) -> Optional[Account]:
-        async with self._lock:
-            now = time.time()
-            available = [a for a in self.accounts if a.is_available() and (not exclude or a.email not in exclude)]
-            if not available:
-                return None
+    def get_by_email(self, email: str) -> Optional[Account]:
+        return next((a for a in self.accounts if a.email == email), None)
 
-            ready = [a for a in available if a.inflight < self.max_inflight and a.next_available_at() <= now]
-            if not ready:
-                return None
+    def _can_acquire_global(self) -> bool:
+        """检查全局并发限制"""
+        if self.global_max_inflight <= 0:
+            return True
+        return self.global_in_use < self.global_max_inflight
 
-            ready.sort(key=lambda a: (a.inflight, a.last_request_started or 0.0, a.last_used or 0.0))
-            best = ready[0]
-            best.inflight += 1
-            best.last_used = now
-            best.last_request_started = now + _jitter_seconds()
-            self._sticky_email = best.email if len(ready) == 1 else None
-            return best
-
-    async def acquire_wait(self, timeout: float = 60, exclude: set = None) -> Optional[Account]:
-        deadline = time.time() + timeout
-        while True:
-            acc = await self.acquire(exclude)
-            if acc:
-                return acc
-
-            async with self._lock:
-                candidates = [
-                    a for a in self.accounts
-                    if a.valid and (not exclude or a.email not in exclude)
-                ]
-                if not candidates:
-                    return None
-                next_ready_at = min((a.next_available_at() for a in candidates), default=time.time())
-
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return None
-
-            evt = asyncio.Event()
-            self._waiters.append(evt)
-            wait_timeout = min(remaining, max(0.05, next_ready_at - time.time() + 0.05))
-            try:
-                await asyncio.wait_for(evt.wait(), timeout=wait_timeout)
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                if evt in self._waiters:
-                    self._waiters.remove(evt)
-
-    def release(self, acc: Account):
-        acc.inflight = max(0, acc.inflight - 1)
-        acc.last_request_finished = time.time()
-        if self._waiters:
-            evt = self._waiters.pop(0)
-            evt.set()
-
-    def mark_invalid(self, acc: Account, reason: str = "invalid", error_message: str = ""):
-        acc.valid = False
-        acc.status_code = reason or "invalid"
-        acc.last_error = error_message or acc.last_error
-        acc.consecutive_failures += 1
-        if reason == "pending_activation":
-            acc.activation_pending = True
-        if self._sticky_email == acc.email:
-            self._sticky_email = None
-        log.warning(f"[账号] {acc.email} 已标记为不可用，状态={acc.status_code}")
-
-    def mark_success(self, acc: Account):
-        acc.consecutive_failures = 0
-        acc.rate_limit_strikes = 0
-        if acc.status_code == "rate_limited":
-            acc.status_code = "valid"
-        if not acc.activation_pending:
-            acc.valid = True
-
-    def mark_rate_limited(self, acc: Account, cooldown: int | None = None, error_message: str = ""):
-        acc.rate_limit_strikes += 1
-        base = cooldown if cooldown is not None else settings.RATE_LIMIT_BASE_COOLDOWN
-        dynamic = min(settings.RATE_LIMIT_MAX_COOLDOWN, int(base * (2 ** max(0, acc.rate_limit_strikes - 1))))
-        dynamic += int(_jitter_seconds())
-        acc.rate_limited_until = time.time() + dynamic
-        acc.status_code = "rate_limited"
-        acc.last_error = error_message or acc.last_error
-        if self._sticky_email == acc.email:
-            self._sticky_email = None
-        log.warning(f"[账号] {acc.email} 已限流冷却 {dynamic} 秒")
+    def _can_queue(self) -> bool:
+        """检查是否可以加入等待队列"""
+        if self.max_queue_size <= 0:
+            return False
+        return self._waiters_queue.qsize() < self.max_queue_size
 
     def status(self):
+        """返回账号池状态"""
         available = [a for a in self.accounts if a.is_available()]
         rate_limited = [a for a in self.accounts if a.get_status_code() == "rate_limited"]
         invalid = [a for a in self.accounts if a.get_status_code() not in ("valid", "rate_limited")]
         activation_pending = [a for a in self.accounts if a.get_status_code() == "pending_activation"]
         banned = [a for a in self.accounts if a.get_status_code() == "banned"]
         in_use = sum(a.inflight for a in self.accounts)
+
         return {
             "total": len(self.accounts),
             "valid": len(available),
@@ -232,7 +206,11 @@ class AccountPool:
             "activation_pending": len(activation_pending),
             "banned": len(banned),
             "in_use": in_use,
-            "max_inflight": self.max_inflight,
-            "waiting": len(self._waiters),
-            "account_min_interval_ms": settings.ACCOUNT_MIN_INTERVAL_MS,
+            "global_in_use": self.global_in_use,
+            "max_inflight_per_account": self.max_inflight_per_account,
+            "recommended_concurrency": self.recommended_concurrency,
+            "max_queue_size": self.max_queue_size,
+            "global_max_inflight": self.global_max_inflight,
+            "waiting": self._waiters_queue.qsize(),
+            "account_min_interval_ms": getattr(settings, "ACCOUNT_MIN_INTERVAL_MS", 0),
         }

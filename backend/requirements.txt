@@ -1,7 +1,10 @@
 fastapi
 uvicorn[standard]
-httpx
+httpx[http2]
 pydantic-settings
-camoufox[geoip]
+python-dotenv
+python-multipart
 tiktoken
 curl_cffi
+camoufox
+oss2

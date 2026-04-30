@@ -46,16 +46,38 @@ function MessageContent({ content }: { content: string }) {
 }
 
 export default function TestPage() {
-  const [messages, setMessages] = useState<{ role: string; content: string; error?: boolean }[]>([])
+  const [messages, setMessages] = useState<{ role: string; content: string; reasoning?: string; error?: boolean }[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
   const [model, setModel] = useState("qwen3.6-plus")
+  const [availableModels, setAvailableModels] = useState<string[]>(["qwen3.6-plus"])
   const [stream, setStream] = useState(true)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
+
+  // 挂载时从 /v1/models 拉真实模型列表，失败回退到默认三项
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`${API_BASE}/v1/models`, { headers: getAuthHeader() })
+        if (!r.ok) return
+        const j = await r.json()
+        const ids = (j?.data || [])
+          .map((m: { id?: string }) => m?.id)
+          .filter((id: unknown): id is string => typeof id === "string" && !!id)
+        if (ids.length) {
+          setAvailableModels(ids)
+          if (!ids.includes(model)) setModel(ids[0])
+        }
+      } catch {
+        // keep fallback list
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const handleSend = async () => {
     if (!input.trim() || loading) return
@@ -120,12 +142,17 @@ export default function TestPage() {
                   break
                 }
                 const content: string = data.choices?.[0]?.delta?.content ?? ""
-                if (content) {
+                const reasoning: string = data.choices?.[0]?.delta?.reasoning_content ?? ""
+                if (content || reasoning) {
                   hasContent = true
                   setMessages(prev => {
                     const msgs = [...prev]
                     const last = msgs[msgs.length - 1]
-                    msgs[msgs.length - 1] = { ...last, content: last.content + content }
+                    msgs[msgs.length - 1] = {
+                      ...last,
+                      content: last.content + content,
+                      reasoning: (last.reasoning || "") + reasoning,
+                    }
                     return msgs
                   })
                 }
@@ -161,9 +188,9 @@ export default function TestPage() {
           <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
             <span className="font-medium text-muted-foreground">模型:</span>
             <select value={model} onChange={e => setModel(e.target.value)} className="bg-transparent font-mono outline-none">
-              <option value="qwen3.6-plus">qwen3.6-plus</option>
-              <option value="qwen-max">qwen-max</option>
-              <option value="qwen-turbo">qwen-turbo</option>
+              {availableModels.map(id => (
+                <option key={id} value={id}>{id}</option>
+              ))}
             </select>
           </div>
           <div
@@ -195,12 +222,24 @@ export default function TestPage() {
                   : msg.error
                     ? "bg-red-500/10 border border-red-500/30 text-red-400"
                     : "bg-muted/30 border text-foreground"}`}>
-                {msg.role === "assistant" && !msg.content && loading ? (
+                {msg.role === "assistant" && !msg.content && !msg.reasoning && loading ? (
                   <span className="animate-pulse flex items-center gap-2 text-muted-foreground">
                     <Bot className="h-4 w-4" /> 思考中...
                   </span>
                 ) : msg.role === "assistant" && !msg.error ? (
-                  <MessageContent content={msg.content} />
+                  <div className="space-y-2">
+                    {msg.reasoning ? (
+                      <details open className="rounded-md border border-dashed border-border/50 bg-muted/20 p-2 text-xs">
+                        <summary className="cursor-pointer select-none text-muted-foreground font-mono">
+                          💭 思考过程 ({msg.reasoning.length} 字)
+                        </summary>
+                        <div className="whitespace-pre-wrap leading-relaxed text-muted-foreground mt-2 pl-2 border-l-2 border-border/30">
+                          {msg.reasoning}
+                        </div>
+                      </details>
+                    ) : null}
+                    {msg.content ? <MessageContent content={msg.content} /> : null}
+                  </div>
                 ) : (
                   <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
                 )}

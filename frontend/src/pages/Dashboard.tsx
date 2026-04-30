@@ -1,83 +1,138 @@
 import { useEffect, useState } from "react"
-import { Server, Activity, ShieldAlert, ActivityIcon, FileJson, Cpu, Shield, Globe, ImageIcon } from "lucide-react"
+import { Server, Activity, ShieldAlert, ActivityIcon, FileJson, Cpu, Shield, Globe, ImageIcon, Paperclip, Flame, Database } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
 
+type AccountRow = {
+  email: string
+  status: string
+  inflight: number
+  max_inflight: number
+  consecutive_failures: number
+  rate_limit_strikes: number
+  last_request_finished: number
+}
+
+type Status = {
+  accounts?: {
+    total?: number
+    valid?: number
+    rate_limited?: number
+    invalid?: number
+    in_use?: number
+    global_in_use?: number
+    waiting?: number
+    max_inflight_per_account?: number
+    max_queue_size?: number
+  }
+  per_account?: AccountRow[]
+  chat_id_pool?: {
+    total_cached?: number
+    target_per_account?: number
+    ttl_seconds?: number
+    per_account?: Record<string, number>
+  } | null
+  runtime?: { asyncio_running_tasks?: number }
+}
+
 export default function Dashboard() {
-  const [status, setStatus] = useState<any>(null)
+  const [status, setStatus] = useState<Status | null>(null)
+  const [errOnce, setErrOnce] = useState(false)
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/admin/status`, { headers: getAuthHeader() })
-      .then(res => {
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/admin/status`, { headers: getAuthHeader() })
         if (!res.ok) throw new Error("Unauthorized")
-        return res.json()
-      })
-      .then(data => setStatus(data))
-      .catch(() => toast.error("状态获取失败，请在「系统设置」检查您的当前会话 Key。"))
+        const data = await res.json()
+        setStatus(data)
+      } catch {
+        if (!errOnce) {
+          toast.error("状态获取失败，请在「系统设置」检查您的当前会话 Key。")
+          setErrOnce(true)
+        }
+      }
+    }
+    fetchStatus()
+    const timer = setInterval(fetchStatus, 3000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const acc = status?.accounts || {}
+  const pool = status?.chat_id_pool
+  const rows = status?.per_account || []
 
   return (
     <div className="space-y-8 max-w-5xl relative">
       <div className="relative z-10">
         <div className="absolute -top-10 -left-10 w-40 h-40 bg-primary/20 blur-[100px] rounded-full pointer-events-none" />
         <h2 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-foreground to-foreground/60 bg-clip-text text-transparent">运行状态</h2>
-        <p className="text-muted-foreground mt-2 text-lg">全局并发监控与千问账号池概览。</p>
+        <p className="text-muted-foreground mt-2 text-lg">全局并发监控与千问账号池概览（每 3 秒自动刷新）。</p>
       </div>
 
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4 relative z-10">
-        <div className="group rounded-2xl border border-border/50 bg-card/40 backdrop-blur-md shadow-xl hover:shadow-primary/5 transition-all duration-500 overflow-hidden relative">
-          <div className="absolute inset-0 bg-gradient-to-br from-primary/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-          <div className="p-6 relative z-10">
-            <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">可用账号</h3>
-              <div className="p-2 bg-primary/10 rounded-lg"><Server className="h-5 w-5 text-primary" /></div>
-            </div>
-            <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent">
-              {status?.accounts?.valid || 0}
-            </div>
-          </div>
-        </div>
-
-        <div className="group rounded-2xl border border-border/50 bg-card/40 backdrop-blur-md shadow-xl hover:shadow-blue-500/5 transition-all duration-500 overflow-hidden relative">
-          <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-          <div className="p-6 relative z-10">
-            <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">当前并发引擎</h3>
-              <div className="p-2 bg-blue-500/10 rounded-lg"><Activity className="h-5 w-5 text-blue-400" /></div>
-            </div>
-            <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent flex items-baseline gap-2">
-              {status?.browser_engine?.pool_size || 0} <span className="text-lg font-bold text-muted-foreground">Pages</span>
-            </div>
-          </div>
-        </div>
-
-        <div className="group rounded-2xl border border-destructive/20 bg-card/40 backdrop-blur-md shadow-xl hover:shadow-destructive/10 transition-all duration-500 overflow-hidden relative">
-          <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-          <div className="p-6 relative z-10">
-            <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-destructive uppercase">排队请求数</h3>
-              <div className="p-2 bg-destructive/10 rounded-lg"><ShieldAlert className="h-5 w-5 text-destructive" /></div>
-            </div>
-            <div className="text-4xl font-black text-destructive drop-shadow-[0_0_15px_rgba(239,68,68,0.3)]">
-              {status?.browser_engine?.queue || 0}
-            </div>
-          </div>
-        </div>
-
-        <div className="group rounded-2xl border border-border/50 bg-card/40 backdrop-blur-md shadow-xl hover:shadow-orange-500/5 transition-all duration-500 overflow-hidden relative">
-          <div className="absolute inset-0 bg-gradient-to-br from-orange-500/10 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-          <div className="p-6 relative z-10">
-            <div className="flex flex-row items-center justify-between space-y-0 pb-4">
-              <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">限流号/失效号</h3>
-              <div className="p-2 bg-orange-500/10 rounded-lg"><ActivityIcon className="h-5 w-5 text-orange-400" /></div>
-            </div>
-            <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent">
-              {status?.accounts?.rate_limited || 0} <span className="text-muted-foreground font-light mx-1">/</span> {status?.accounts?.invalid || 0}
-            </div>
-          </div>
-        </div>
+        <StatCard icon={<Server className="h-5 w-5 text-primary" />} title="可用账号" value={String(acc.valid ?? 0)} accent="primary" sub={`共 ${acc.total ?? 0} 个`} />
+        <StatCard icon={<Activity className="h-5 w-5 text-blue-400" />} title="当前并发" value={String(acc.in_use ?? 0)} accent="blue" sub={`全局上限 ${acc.global_in_use ?? 0}`} />
+        <StatCard icon={<ShieldAlert className="h-5 w-5 text-destructive" />} title="排队请求" value={String(acc.waiting ?? 0)} accent="destructive" sub={`队列上限 ${acc.max_queue_size ?? 0}`} />
+        <StatCard icon={<ActivityIcon className="h-5 w-5 text-orange-400" />} title="限流号/失效号" value={`${acc.rate_limited ?? 0} / ${acc.invalid ?? 0}`} accent="orange" />
       </div>
+
+      <div className="grid gap-6 md:grid-cols-2 relative z-10">
+        <StatCard icon={<Flame className="h-5 w-5 text-rose-400" />} title="Chat_ID 预热池" value={String(pool?.total_cached ?? 0)} accent="rose" sub={pool ? `每账号目标 ${pool.target_per_account}  · TTL ${Math.round((pool.ttl_seconds || 0) / 60)} 分钟` : "未启用"} />
+        <StatCard icon={<Database className="h-5 w-5 text-cyan-400" />} title="异步任务" value={String(status?.runtime?.asyncio_running_tasks ?? 0)} accent="cyan" sub="asyncio active task count" />
+      </div>
+
+      {rows.length > 0 && (
+        <div className="rounded-2xl border border-border/50 bg-card/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
+          <div className="absolute inset-0 bg-gradient-to-b from-black/[0.02] dark:from-white/[0.02] to-transparent pointer-events-none" />
+          <div className="flex flex-col space-y-2 p-6 border-b border-border/50 bg-muted/10 relative z-10">
+            <h3 className="font-extrabold text-xl tracking-tight flex items-center gap-3">
+              <span className="bg-primary w-2 h-6 rounded-full shadow-[0_0_10px_rgba(168,85,247,0.5)]"></span>
+              账号并发详情
+            </h3>
+          </div>
+          <div className="overflow-x-auto relative z-10">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/20 text-xs uppercase text-muted-foreground">
+                <tr>
+                  <th className="text-left px-6 py-3 font-semibold">邮箱</th>
+                  <th className="text-left px-4 py-3 font-semibold">状态</th>
+                  <th className="text-right px-4 py-3 font-semibold">在途</th>
+                  <th className="text-right px-4 py-3 font-semibold">预热 chat_id</th>
+                  <th className="text-right px-4 py-3 font-semibold">连失</th>
+                  <th className="text-right px-4 py-3 font-semibold">限流次</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border/40">
+                {rows.map(r => {
+                  const warmSize = pool?.per_account?.[r.email] ?? 0
+                  const badge = r.status === "valid" ? "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30"
+                              : r.status === "rate_limited" ? "bg-orange-500/15 text-orange-300 ring-orange-500/30"
+                              : "bg-red-500/15 text-red-300 ring-red-500/30"
+                  return (
+                    <tr key={r.email} className="hover:bg-muted/10 transition-colors">
+                      <td className="px-6 py-3 font-mono text-xs text-foreground/80 break-all">{r.email}</td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-bold ring-1 ${badge}`}>{r.status}</span>
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {r.inflight}<span className="text-muted-foreground">/{r.max_inflight}</span>
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        <span className={warmSize === 0 ? "text-muted-foreground" : "text-rose-400 font-semibold"}>{warmSize}</span>
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono text-xs">{r.consecutive_failures}</td>
+                      <td className="px-4 py-3 text-right font-mono text-xs">{r.rate_limit_strikes}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       <div className="rounded-2xl border border-border/50 bg-card/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-b from-black/[0.02] dark:from-white/[0.02] to-transparent pointer-events-none" />
@@ -90,44 +145,62 @@ export default function Dashboard() {
         </div>
         <div className="p-0 relative z-10">
           <div className="divide-y divide-border/50 text-sm">
-            <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="p-2 rounded-md bg-emerald-500/10"><FileJson className="h-5 w-5 text-emerald-500 dark:text-emerald-400" /></div>
-                <div className="font-semibold text-foreground/80">POST /v1/chat/completions</div>
-              </div>
-              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold bg-emerald-500/10 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300 ring-1 ring-emerald-500/20 dark:ring-emerald-500/30">OpenAI</span>
-            </div>
-            <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="p-2 rounded-md bg-blue-500/10"><Cpu className="h-5 w-5 text-blue-500 dark:text-blue-400" /></div>
-                <div className="font-semibold text-foreground/80">POST /v1/messages</div>
-              </div>
-              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold bg-blue-500/10 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300 ring-1 ring-blue-500/20 dark:ring-blue-500/30">Anthropic</span>
-            </div>
-            <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="p-2 rounded-md bg-yellow-500/10"><Globe className="h-5 w-5 text-yellow-600 dark:text-yellow-400" /></div>
-                <div className="font-semibold text-foreground/80">POST /v1/models/gemini-pro:generateContent</div>
-              </div>
-              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold bg-yellow-500/10 text-yellow-600 dark:bg-yellow-500/20 dark:text-yellow-300 ring-1 ring-yellow-500/20 dark:ring-yellow-500/30">Gemini</span>
-            </div>
-            <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="p-2 rounded-md bg-purple-500/10"><ImageIcon className="h-5 w-5 text-purple-500 dark:text-purple-400" /></div>
-                <div className="font-semibold text-foreground/80">POST /v1/images/generations</div>
-              </div>
-              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold bg-purple-500/10 text-purple-600 dark:bg-purple-500/20 dark:text-purple-300 ring-1 ring-purple-500/20 dark:ring-purple-500/30">Image Gen</span>
-            </div>
-            <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
-              <div className="flex items-center gap-4">
-                <div className="p-2 rounded-md bg-slate-500/10"><Shield className="h-5 w-5 text-slate-600 dark:text-slate-400" /></div>
-                <div className="font-semibold text-foreground/80">GET /</div>
-              </div>
-              <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-bold bg-slate-500/10 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300 ring-1 ring-slate-500/20 dark:ring-slate-500/30">健康检查</span>
-            </div>
+            <EndpointRow icon={<FileJson className="h-5 w-5 text-emerald-500 dark:text-emerald-400" />} iconBg="bg-emerald-500/10" path="POST /v1/chat/completions" tag="OpenAI" tagColor="emerald" />
+            <EndpointRow icon={<Cpu className="h-5 w-5 text-blue-500 dark:text-blue-400" />} iconBg="bg-blue-500/10" path="POST /v1/messages" tag="Anthropic" tagColor="blue" />
+            <EndpointRow icon={<Globe className="h-5 w-5 text-yellow-600 dark:text-yellow-400" />} iconBg="bg-yellow-500/10" path="POST /v1/models/gemini-pro:generateContent" tag="Gemini" tagColor="yellow" />
+            <EndpointRow icon={<ImageIcon className="h-5 w-5 text-purple-500 dark:text-purple-400" />} iconBg="bg-purple-500/10" path="POST /v1/images/generations" tag="Image Gen" tagColor="purple" />
+            <EndpointRow icon={<Paperclip className="h-5 w-5 text-cyan-500 dark:text-cyan-400" />} iconBg="bg-cyan-500/10" path="POST /v1/files" tag="Files" tagColor="cyan" />
+            <EndpointRow icon={<Shield className="h-5 w-5 text-slate-600 dark:text-slate-400" />} iconBg="bg-slate-500/10" path="GET /" tag="健康检查" tagColor="slate" />
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+function StatCard({ icon, title, value, accent, sub }: { icon: React.ReactNode; title: string; value: string; accent: string; sub?: string }) {
+  const shadowMap: Record<string, string> = {
+    primary: "hover:shadow-primary/5",
+    blue: "hover:shadow-blue-500/5",
+    destructive: "hover:shadow-destructive/10",
+    orange: "hover:shadow-orange-500/5",
+    rose: "hover:shadow-rose-500/5",
+    cyan: "hover:shadow-cyan-500/5",
+  }
+  const gradMap: Record<string, string> = {
+    primary: "from-primary/10",
+    blue: "from-blue-500/10",
+    destructive: "from-destructive/10",
+    orange: "from-orange-500/10",
+    rose: "from-rose-500/10",
+    cyan: "from-cyan-500/10",
+  }
+  return (
+    <div className={`group rounded-2xl border border-border/50 bg-card/40 backdrop-blur-md shadow-xl ${shadowMap[accent]} transition-all duration-500 overflow-hidden relative`}>
+      <div className={`absolute inset-0 bg-gradient-to-br ${gradMap[accent]} to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500`} />
+      <div className="p-6 relative z-10">
+        <div className="flex flex-row items-center justify-between space-y-0 pb-4">
+          <h3 className="tracking-tight text-sm font-semibold text-foreground/80 uppercase">{title}</h3>
+          <div className="p-2 bg-primary/10 rounded-lg">{icon}</div>
+        </div>
+        <div className="text-4xl font-black bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text text-transparent">
+          {value}
+        </div>
+        {sub ? <div className="text-xs text-muted-foreground mt-2">{sub}</div> : null}
+      </div>
+    </div>
+  )
+}
+
+function EndpointRow({ icon, iconBg, path, tag, tagColor }: { icon: React.ReactNode; iconBg: string; path: string; tag: string; tagColor: string }) {
+  const tagClass = `bg-${tagColor}-500/10 text-${tagColor}-600 dark:bg-${tagColor}-500/20 dark:text-${tagColor}-300 ring-1 ring-${tagColor}-500/20 dark:ring-${tagColor}-500/30`
+  return (
+    <div className="flex justify-between items-center px-8 py-5 hover:bg-black/5 dark:hover:bg-white/[0.02] transition-colors">
+      <div className="flex items-center gap-4">
+        <div className={`p-2 rounded-md ${iconBg}`}>{icon}</div>
+        <div className="font-semibold text-foreground/80">{path}</div>
+      </div>
+      <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-bold ${tagClass}`}>{tag}</span>
     </div>
   )
 }

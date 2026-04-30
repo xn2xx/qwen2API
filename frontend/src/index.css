@@ -140,9 +140,20 @@
   
   @media (prefers-color-scheme: dark) {
     body::before {
-      background-image: 
+      background-image:
         radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.08), transparent 25%),
         radial-gradient(circle at 85% 30%, rgba(168, 85, 247, 0.08), transparent 25%);
     }
+  }
+
+  /* 修复原生 <select> 下拉在暗色主题下 option 白底白字不可见的问题 */
+  select option {
+    background-color: hsl(var(--card));
+    color: hsl(var(--card-foreground));
+  }
+  select option:checked,
+  select option:hover {
+    background-color: hsl(var(--accent));
+    color: hsl(var(--accent-foreground));
   }
 }
