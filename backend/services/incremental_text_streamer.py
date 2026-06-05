@@ -3,7 +3,7 @@
 动机：
     1. Qwen 有时在答复开头先吐一小段"道歉前缀"（"Sorry..."/"我无法..."）然后才开始
        真实内容。如果代理一字一字直接透传，用户会看到拒绝前缀闪烁再被覆盖。
-    2. 跨 chunk 的清洗规则（如识别 ##TOOL_CALL## 开始标记）需要一定上下文，直接透传
+    2. Cross-chunk cleanup needs context, e.g. detecting QNML/legacy tool-call start markers.
        会把边界附近的文本过早发出去。
 
 策略：

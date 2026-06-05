@@ -3,11 +3,21 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from backend.runtime.execution import build_tool_directive
+from backend.runtime.execution import RuntimeToolDirective, build_tool_directive, tool_directive_visible_text
+from backend.runtime.visible_text import sanitize_visible_text, sanitize_visible_text_blocks
 
 
-def build_openai_completion_payload(*, completion_id: str, created: int, model_name: str, prompt: str, execution, standard_request) -> dict[str, Any]:
-    directive = build_tool_directive(standard_request, execution.state)
+def build_openai_completion_payload(
+    *,
+    completion_id: str,
+    created: int,
+    model_name: str,
+    prompt: str,
+    execution,
+    standard_request,
+    directive: RuntimeToolDirective | None = None,
+) -> dict[str, Any]:
+    directive = directive or build_tool_directive(standard_request, execution.state)
     if directive.stop_reason == "tool_use":
         oai_tool_calls = [
             {
@@ -25,7 +35,10 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         finish_reason = "tool_calls"
     else:
         oai_tool_calls = []
-        msg = {"role": "assistant", "content": execution.state.answer_text}
+        visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+        msg = {"role": "assistant", "content": visible_text}
+        if execution.state.reasoning_text:
+            msg["reasoning_content"] = sanitize_visible_text(execution.state.reasoning_text)
         finish_reason = "stop"
 
     log_payload = [
@@ -41,7 +54,7 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         "[OAI] response finish_reason=%s tool_calls=%s text_preview=%r",
         finish_reason,
         log_payload,
-        execution.state.answer_text[:300],
+        tool_directive_visible_text(directive, execution.state.answer_text)[:300],
     )
 
     return {
@@ -52,18 +65,33 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": len(prompt),
-            "completion_tokens": len(execution.state.answer_text),
-            "total_tokens": len(prompt) + len(execution.state.answer_text),
+            "completion_tokens": len(tool_directive_visible_text(directive, execution.state.answer_text)),
+            "total_tokens": len(prompt) + len(tool_directive_visible_text(directive, execution.state.answer_text)),
         },
     }
 
 
-def build_anthropic_message_payload(*, msg_id: str, model_name: str, prompt: str, execution, standard_request) -> dict[str, Any]:
-    directive = build_tool_directive(standard_request, execution.state)
+def build_anthropic_message_payload(
+    *,
+    msg_id: str,
+    model_name: str,
+    prompt: str,
+    execution,
+    standard_request,
+    directive: RuntimeToolDirective | None = None,
+) -> dict[str, Any]:
+    directive = directive or build_tool_directive(standard_request, execution.state)
     content_blocks: list[dict[str, Any]] = []
     if execution.state.reasoning_text:
-        content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
-    content_blocks.extend(directive.tool_blocks)
+        content_blocks.append({"type": "thinking", "thinking": sanitize_visible_text(execution.state.reasoning_text)})
+    content_blocks.extend(sanitize_visible_text_blocks(directive.tool_blocks))
+    visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+    if (
+        directive.stop_reason != "tool_use"
+        and visible_text
+        and not any(block.get("type") == "text" for block in content_blocks)
+    ):
+        content_blocks.append({"type": "text", "text": visible_text})
     return {
         "id": msg_id,
         "type": "message",
@@ -72,16 +100,17 @@ def build_anthropic_message_payload(*, msg_id: str, model_name: str, prompt: str
         "content": content_blocks,
         "stop_reason": directive.stop_reason,
         "stop_sequence": None,
-        "usage": {"input_tokens": len(prompt), "output_tokens": len(execution.state.answer_text)},
+        "usage": {"input_tokens": len(prompt), "output_tokens": len(visible_text)},
     }
 
 
 def build_gemini_generate_payload(*, execution) -> dict[str, Any]:
+    visible_text = sanitize_visible_text(execution.state.answer_text)
     return {
         "candidates": [
             {
                 "content": {
-                    "parts": [{"text": execution.state.answer_text}],
+                    "parts": [{"text": visible_text}],
                     "role": "model",
                 }
             }

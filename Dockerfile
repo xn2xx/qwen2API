@@ -55,19 +55,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt /tmp/requirements.txt
-RUN pip install -r /tmp/requirements.txt
+RUN python -m pip install --upgrade pip && python -m pip install -r /tmp/requirements.txt
 
 # Download Camoufox browser at build time so runtime hosts do not need to fetch it again.
 RUN python -m camoufox fetch
 
 COPY backend/ ./backend/
 COPY start.py ./
-COPY --from=frontend-builder /app/dist ./frontend/dist
 RUN mkdir -p /workspace/data /workspace/logs /workspace/frontend
+COPY --from=frontend-builder /app/dist ./frontend/dist
 
 EXPOSE 7860
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT:-7860}/healthz" || exit 1
 
-CMD ["sh", "-c", "python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-7860} --workers ${WORKERS:-1}"]
+CMD ["sh", "-c", "exec python -m uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-7860} --workers ${WORKERS:-1}"]

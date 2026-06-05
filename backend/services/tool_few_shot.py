@@ -34,9 +34,36 @@ _CORE_TOOL_PATTERNS = [
     re.compile(r"^(attempt_completion|ask_followup_question|AskFollowupQuestion)$", re.IGNORECASE),
 ]
 
+_FEW_SHOT_EXCLUDED_NAMES = {
+    "agent",
+    "askuserquestion",
+    "croncreate",
+    "crondelete",
+    "cronlist",
+    "enterplanmode",
+    "exitplanmode",
+    "enterworktree",
+    "exitworktree",
+    "monitor",
+    "pushnotification",
+    "schedulewakeup",
+    "taskcreate",
+    "taskdelete",
+    "taskget",
+    "tasklist",
+    "taskoutput",
+    "taskstop",
+    "taskupdate",
+}
+
 
 def _is_core_tool(name: str) -> bool:
     return any(p.match(name) for p in _CORE_TOOL_PATTERNS)
+
+
+def _is_few_shot_safe_tool(name: str) -> bool:
+    key = re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+    return key not in _FEW_SHOT_EXCLUDED_NAMES
 
 
 def _tool_namespace(name: str) -> str:
@@ -114,20 +141,21 @@ def pick_few_shot_tools(tools: list[dict[str, Any]], max_third_party: int = 4) -
     if not tools:
         return []
 
-    core_tools = [t for t in tools if _is_core_tool(t.get("name", ""))]
-    third_party = [t for t in tools if not _is_core_tool(t.get("name", ""))]
+    safe_tools = [t for t in tools if _is_few_shot_safe_tool(t.get("name", ""))]
+    core_tools = [t for t in safe_tools if _is_core_tool(t.get("name", ""))]
+    third_party = [t for t in safe_tools if not _is_core_tool(t.get("name", ""))]
 
     chosen: list[dict[str, Any]] = []
 
     # 1) 核心代表
     def _find(pattern: re.Pattern) -> dict[str, Any] | None:
-        return next((t for t in tools if pattern.match(t.get("name", ""))), None)
+        return next((t for t in safe_tools if pattern.match(t.get("name", ""))), None)
 
-    core_pick = _find(_CORE_TOOL_PATTERNS[0]) or _find(_CORE_TOOL_PATTERNS[2])
-    if core_pick is None and core_tools:
-        core_pick = core_tools[0]
-    if core_pick is not None:
-        chosen.append(core_pick)
+    for core_pick in (_find(_CORE_TOOL_PATTERNS[0]), _find(_CORE_TOOL_PATTERNS[2])):
+        if core_pick is not None and core_pick not in chosen:
+            chosen.append(core_pick)
+    if not chosen and core_tools:
+        chosen.append(core_tools[0])
 
     # 2) 第三方按 namespace 分组
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -137,14 +165,14 @@ def pick_few_shot_tools(tools: list[dict[str, Any]], max_third_party: int = 4) -
 
     # 命名空间按工具数量降序；每个空间取描述最长的一个作代表
     for ns, items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
-        if len(chosen) >= 1 + max_third_party:
+        if len(chosen) >= 2 + max_third_party:
             break
         rep = max(items, key=lambda x: len(x.get("description", "") or ""))
         chosen.append(rep)
 
     # 还是空就退化为第一个工具
-    if not chosen and tools:
-        chosen.append(tools[0])
+    if not chosen and safe_tools:
+        chosen.append(safe_tools[0])
 
     return chosen
 
@@ -165,7 +193,7 @@ def render_few_shot_turn(
     """渲染合成的 [user, assistant] 对话。返回 (user_text, assistant_text)。
 
     render_tool_call(name, input) -> str: 使用调用方的工具调用渲染函数
-      （通常是 ##TOOL_CALL##\n{json}\n##END_CALL##）。
+      Usually QNML <|QNML|tool_calls> / <|QNML|invoke> / <|QNML|parameter>.
     """
     actions = [render_tool_call(t.get("name", ""), build_example_params(t)) for t in few_shot_tools]
     user_text = (

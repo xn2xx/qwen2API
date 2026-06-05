@@ -72,7 +72,7 @@ def fetch_browser():
 
 
 def start_frontend() -> subprocess.Popen:
-    print("⚡ [3/4] 启动前端开发服务器...")
+    print("⚡ [4/4] 启动前端开发服务器...")
     is_windows = os.name == "nt"
 
     if not (FRONTEND_DIR / "node_modules").exists():
@@ -127,7 +127,7 @@ def kill_port(port: int):
 
 
 def start_backend() -> subprocess.Popen:
-    print("⚡ [4/4] 启动后端服务...")
+    print("⚡ [3/4] 启动后端服务...")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(WORKSPACE_DIR)
     env["PYTHONIOENCODING"] = "utf-8"

@@ -12,9 +12,12 @@ class SimplifiedLogFilter(logging.Filter):
         r"HTTP Request: GET https://chat\.qwen\.ai",
         r"HTTP Request: DELETE https://chat\.qwen\.ai",
         r"\[ToolParse\].*原始回复",
-        r"prompt preview \(first \d+ chars\)",
+        r"prompt preview (?:\(first \d+ chars\)|first \d+ chars:)",
         r"feature_config:",
-        r"prompt contains ##TOOL_CALL##",
+        r"function_calling=.*auto_search=.*code_interpreter=.*plugins_enabled",
+        r"\[上游\] 功能配置:",
+        r"prompt contains (?:QNML|legacy|##TOOL_CALL##)",
+        r"\[Upstream\] prompt contains QNML/legacy tool markers",
     ]
 
     # 需要简化的日志模式（保留但精简）

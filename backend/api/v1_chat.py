@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+import asyncio
 import json
 import logging
 import time
@@ -8,12 +9,13 @@ from typing import Any, Awaitable, Callable
 from backend.adapter.standard_request import StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
+from backend.core.request_trace import log_test_prompt, prompt_tail
 from backend.services.attachment_preprocessor import preprocess_attachments
 from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
 from backend.services.auth_quota import resolve_auth_context
+from backend.services.client_profiles import detect_openai_client_profile
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
-from backend.services.prompt_builder import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.services.response_formatters import build_openai_completion_payload
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
@@ -32,10 +34,7 @@ OpenAIDeltaHandler = Callable[[dict[str, Any], str | None, list[dict[str, Any]] 
 
 
 def _detect_openai_client_profile(request: Request, req_data: dict) -> str:
-    del req_data
-    if request.headers.get("x-anthropic-billing-header"):
-        return CLAUDE_CODE_OPENAI_PROFILE
-    return OPENCLAW_OPENAI_PROFILE
+    return detect_openai_client_profile(request.headers, req_data)
 
 
 def _build_standard_request(req_data: dict, *, client_profile: str) -> StandardRequest:
@@ -116,6 +115,14 @@ async def chat_completions(request: Request):
     created = int(time.time())
 
     with request_context(req_id=new_request_id(), surface="openai", requested_model=model_name, resolved_model=qwen_model):
+        log_test_prompt(
+            log,
+            surface="openai",
+            model=qwen_model,
+            stream=standard_request.stream,
+            tools=[t.get("name") for t in tools],
+            prompt=prompt,
+        )
         log.info(
             "[OAI] model=%s stream=%s tool_enabled=%s profile=%s tools=%s prompt_len=%s prompt_tail=%r",
             qwen_model,
@@ -124,68 +131,93 @@ async def chat_completions(request: Request):
             standard_request.client_profile,
             [t.get('name') for t in tools],
             len(prompt),
-            prompt[-500:],
+            prompt_tail(prompt),
         )
 
         if standard_request.stream:
             async def generate():
                 async with app.state.session_locks.hold(session_key):
-                    try:
-                        update_request_context(stream_attempt=1)
-                        translator = OpenAIStreamTranslator(
-                            completion_id=completion_id,
-                            created=created,
-                            model_name=model_name,
-                            client_profile=standard_request.client_profile,
-                            build_final_directive=lambda answer_text: build_tool_directive(
-                                standard_request,
-                                RuntimeAttemptState(answer_text=answer_text),
-                            ),
-                            allowed_tool_names=standard_request.tool_names,
-                        )
-
-                        async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                            translator.on_delta(evt, text_chunk, tool_calls)
-
-                        result = await run_retryable_completion_bridge(
-                            client=client,
-                            standard_request=standard_request,
-                            prompt=prompt,
-                            users_db=users_db,
-                            token=token,
+                    queue: asyncio.Queue[str | None] = asyncio.Queue()
+                    translator = OpenAIStreamTranslator(
+                        completion_id=completion_id,
+                        created=created,
+                        model_name=model_name,
+                        client_profile=standard_request.client_profile,
+                        build_final_directive=lambda answer_text: build_tool_directive(
+                            standard_request,
+                            RuntimeAttemptState(answer_text=answer_text),
                             history_messages=history_messages,
-                            max_attempts=request_max_attempts(standard_request),
-                            usage_delta_factory=build_usage_delta_factory(prompt),
-                            allow_after_visible_output=True,
-                            capture_events=False,
-                            on_delta=on_delta,
-                        )
-                        execution = result.execution
-                        directive = result.directive or build_tool_directive(standard_request, execution.state)
-                        assistant_message = build_openai_assistant_history_message(
-                            execution=execution,
-                            request=standard_request,
-                            directive=directive,
-                        )
-                        await persist_session_turn(
-                            app=app,
-                            request=standard_request,
-                            surface="openai",
-                            execution=execution,
-                            assistant_message=assistant_message,
-                        )
-                        final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
-                        for chunk in translator.finalize(final_finish_reason):
+                        ),
+                        allowed_tool_names=standard_request.tool_names,
+                    )
+
+                    async def _emit_pending() -> None:
+                        for pending in translator.drain_pending():
+                            await queue.put(pending)
+
+                    async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
+                        translator.on_delta(evt, text_chunk, tool_calls)
+                        await _emit_pending()
+
+                    async def _run_request() -> None:
+                        try:
+                            update_request_context(stream_attempt=1)
+                            result = await run_retryable_completion_bridge(
+                                client=client,
+                                standard_request=standard_request,
+                                prompt=prompt,
+                                users_db=users_db,
+                                token=token,
+                                history_messages=history_messages,
+                                max_attempts=request_max_attempts(standard_request),
+                                usage_delta_factory=build_usage_delta_factory(prompt),
+                                # Once chunks have been yielded to the client they cannot be retracted.
+                                # Keep retry-before-output behavior, but do not retry after visible output.
+                                allow_after_visible_output=False,
+                                capture_events=False,
+                                on_delta=on_delta,
+                            )
+                            execution = result.execution
+                            directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
+                            assistant_message = build_openai_assistant_history_message(
+                                execution=execution,
+                                request=standard_request,
+                                directive=directive,
+                            )
+                            await persist_session_turn(
+                                app=app,
+                                request=standard_request,
+                                surface="openai",
+                                execution=execution,
+                                assistant_message=assistant_message,
+                            )
+                            final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
+                            for chunk in translator.finalize(final_finish_reason, directive):
+                                await queue.put(chunk)
+                        except HTTPException as he:
+                            await clear_invalidated_session_chat(app=app, request=standard_request)
+                            await queue.put(f"data: {json.dumps({'error': he.detail})}\n\n")
+                        except Exception as e:
+                            await clear_invalidated_session_chat(app=app, request=standard_request)
+                            await queue.put(f"data: {json.dumps({'error': str(e)})}\n\n")
+                        finally:
+                            await queue.put(None)
+
+                    task = asyncio.create_task(_run_request())
+                    try:
+                        while True:
+                            chunk = await queue.get()
+                            if chunk is None:
+                                break
                             yield chunk
-                        return
-                    except HTTPException as he:
-                        await clear_invalidated_session_chat(app=app, request=standard_request)
-                        yield f"data: {json.dumps({'error': he.detail})}\n\n"
-                        return
-                    except Exception as e:
-                        await clear_invalidated_session_chat(app=app, request=standard_request)
-                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                        return
+                        await task
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
 
             return StreamingResponse(
                 generate(),
@@ -208,7 +240,7 @@ async def chat_completions(request: Request):
                     allow_after_visible_output=True,
                 )
                 execution = result.execution
-                directive = result.directive or build_tool_directive(standard_request, execution.state)
+                directive = result.directive or build_tool_directive(standard_request, execution.state, history_messages=history_messages)
                 assistant_message = build_openai_assistant_history_message(
                     execution=execution,
                     request=standard_request,
@@ -229,6 +261,7 @@ async def chat_completions(request: Request):
                     prompt=result.prompt,
                     execution=execution,
                     standard_request=standard_request,
+                    directive=directive,
                 ))
         except Exception as e:
             await clear_invalidated_session_chat(app=app, request=standard_request)

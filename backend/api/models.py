@@ -3,20 +3,15 @@ from fastapi.responses import JSONResponse
 
 from backend.core.config import MODEL_MAP, resolve_model
 from backend.services.auth_quota import resolve_auth_context
+from backend.services.model_catalog import build_fallback_model_list, build_model_entry, build_openai_model_list
+from backend.services.model_modes import parse_model_mode
 from backend.services.qwen_client import QwenClient
 
 router = APIRouter()
 
 
 def _build_model_list_payload() -> dict:
-    seen: set[str] = set()
-    data: list[dict] = []
-    for model_id in MODEL_MAP:
-        if model_id in seen:
-            continue
-        seen.add(model_id)
-        data.append({"id": model_id, "object": "model", "owned_by": "qwen2api"})
-    return {"object": "list", "data": data}
+    return build_fallback_model_list(MODEL_MAP)
 
 
 @router.get("/v1/models")
@@ -32,20 +27,7 @@ async def list_models(request: Request):
     upstream_models = await client.list_models_from_pool()
 
     if upstream_models:
-        data = []
-        for item in upstream_models:
-            if not isinstance(item, dict):
-                continue
-            model_id = item.get("id") or item.get("model") or item.get("name")
-            if not model_id:
-                continue
-            data.append({
-                "id": model_id,
-                "object": "model",
-                "owned_by": item.get("owned_by", "qwen"),
-                "created": item.get("created_at") or 0,
-            })
-        return JSONResponse({"object": "list", "data": data})
+        return JSONResponse(build_openai_model_list(upstream_models))
 
     # 上游不可用时才回退到静态 MODEL_MAP（包含 gpt-4o/claude 等别名）
     return JSONResponse(_build_model_list_payload())
@@ -53,7 +35,34 @@ async def list_models(request: Request):
 
 @router.get("/v1/models/{model_id}")
 async def get_model(model_id: str):
-    resolved = resolve_model(model_id)
-    if resolved == model_id and model_id not in MODEL_MAP:
+    mode = parse_model_mode(model_id)
+    if not mode.base_model:
         raise HTTPException(status_code=404, detail={"error": {"message": f"Model '{model_id}' not found", "type": "invalid_request_error"}})
-    return JSONResponse({"id": model_id, "object": "model", "owned_by": "qwen2api", "resolved_model": resolved})
+    resolved = resolve_model(mode.base_model)
+    capabilities = {}
+    if mode.force_thinking:
+        capabilities["thinking"] = True
+    if mode.mode == "deep_research":
+        capabilities["deep_research"] = True
+        capabilities["search"] = True
+    if mode.mode == "search":
+        capabilities["search"] = True
+    if mode.mode == "image":
+        capabilities["image_gen"] = True
+    if mode.mode == "video":
+        capabilities["video_gen"] = True
+    if mode.mode == "webdev":
+        capabilities["web_dev"] = True
+    if mode.mode == "slides":
+        capabilities["slides"] = True
+    payload = build_model_entry(
+        model_id=model_id,
+        base_model=mode.base_model,
+        capabilities=capabilities,
+        mode=mode.mode,
+        display_name=model_id,
+        family=resolved.split("-", 1)[0],
+        owned_by="qwen2api",
+    )
+    payload["resolved_model"] = resolved
+    return JSONResponse(payload)

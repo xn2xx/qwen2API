@@ -4,6 +4,7 @@ import json
 
 from backend.toolcall.fallback_textkv import parse_textkv_format
 from backend.toolcall.formats_json import parse_json_format
+from backend.toolcall.formats_qnml import canonicalize_qnml_markup, parse_qnml_format
 from backend.toolcall.formats_xml import parse_xml_format
 
 
@@ -38,12 +39,13 @@ def _has_top_level_json_tool_syntax(text: str) -> bool:
 
 
 def _has_xml_like_tool_syntax(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in ("<invoke", "<tool_call", "</tool_call>"))
+    lowered = canonicalize_qnml_markup(text).lower()
+    return any(marker in lowered for marker in ("<|qnml|tool_calls", "</|qnml|tool_calls", "<|qnml|invoke", "<qnml", "</qnml", "<tool_calls", "</tool_calls", "<invoke", "<tool_call", "</tool_call>"))
 
 
 def parse_tool_calls_detailed(text: str, allowed_names: set[str]) -> dict[str, object]:
     candidates = [
+        ("qnml", parse_qnml_format(text, allowed_names)),
         ("json", parse_json_format(text, allowed_names)),
         ("xml", parse_xml_format(text, allowed_names)),
         ("textkv", parse_textkv_format(text, allowed_names)),
@@ -63,6 +65,6 @@ def parse_tool_calls_detailed(text: str, allowed_names: set[str]) -> dict[str, o
         "saw_tool_syntax": (
             _has_top_level_json_tool_syntax(text)
             or _has_xml_like_tool_syntax(text)
-            or any(marker in text for marker in ("function.name:", "function.arguments:", '"name="'))
+            or any(marker in text for marker in ("<|QNML|tool_calls", "</|QNML|tool_calls", "<|QNML|invoke", "<tool_calls", "</tool_calls", "function.name:", "function.arguments:", '"name="'))
         ),
     }

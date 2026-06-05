@@ -7,7 +7,10 @@ from typing import Any
 
 from backend.adapter.standard_request import StandardRequest, CLAUDE_CODE_OPENAI_PROFILE
 from backend.core.config import resolve_model
+from backend.runtime.visible_text import sanitize_visible_text, sanitize_visible_text_blocks
+from backend.services.model_modes import parse_model_mode
 from backend.services.prompt_builder import messages_to_prompt
+from backend.services.workspace_context import derive_workspace_root
 from backend.toolcall.normalize import build_tool_name_registry
 
 log = logging.getLogger("qwen2api.cli_proxy")
@@ -32,6 +35,9 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "gpt-4o")
+        model_mode = parse_model_mode(model_name)
+        workspace_root = derive_workspace_root(req_data)
+        req_data = {**req_data, "_workspace_root": workspace_root}
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -44,7 +50,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt_result.prompt,
             response_model=model_name,
-            resolved_model=resolve_model(model_name),
+            resolved_model=resolve_model(model_mode.base_model),
             surface="openai",
             client_profile=client_profile,
             requested_model=model_name,
@@ -53,6 +59,13 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            chat_type=model_mode.chat_type,
+            thinking_enabled=True if model_mode.force_thinking else None,
+            force_thinking=model_mode.force_thinking,
+            enable_search=model_mode.chat_type == "deep_research",
+            model_mode=model_mode.mode,
+            skip_prewarmed_chat_ids=model_mode.chat_type != "t2t",
+            workspace_root=workspace_root,
         )
 
     @staticmethod
@@ -68,6 +81,9 @@ class CLIProxy:
             StandardRequest: 统一的标准请求对象
         """
         model_name = req_data.get("model", "claude-3-5-sonnet")
+        model_mode = parse_model_mode(model_name)
+        workspace_root = derive_workspace_root(req_data)
+        req_data = {**req_data, "_workspace_root": workspace_root}
         prompt_result = messages_to_prompt(req_data, client_profile=client_profile)
 
         tools = prompt_result.tools
@@ -80,7 +96,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt_result.prompt,
             response_model=model_name,
-            resolved_model=resolve_model(model_name),
+            resolved_model=resolve_model(model_mode.base_model),
             surface="anthropic",
             client_profile=client_profile,
             requested_model=model_name,
@@ -89,6 +105,13 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry=build_tool_name_registry(tool_names),
             tool_enabled=prompt_result.tool_enabled,
+            chat_type=model_mode.chat_type,
+            thinking_enabled=True if model_mode.force_thinking else None,
+            force_thinking=model_mode.force_thinking,
+            enable_search=model_mode.chat_type == "deep_research",
+            model_mode=model_mode.mode,
+            skip_prewarmed_chat_ids=model_mode.chat_type != "t2t",
+            workspace_root=workspace_root,
         )
 
     @staticmethod
@@ -104,6 +127,7 @@ class CLIProxy:
         Returns:
             StandardRequest: 统一的标准请求对象
         """
+        model_mode = parse_model_mode(model)
         prompt = CLIProxy._extract_gemini_prompt(req_data)
         stream_requested = CLIProxy._is_gemini_stream_request(req_data) if stream is None else stream
 
@@ -114,7 +138,7 @@ class CLIProxy:
         return StandardRequest(
             prompt=prompt,
             response_model=model,
-            resolved_model=resolve_model(model),
+            resolved_model=resolve_model(model_mode.base_model),
             surface="gemini",
             requested_model=model,
             content=prompt,
@@ -123,6 +147,12 @@ class CLIProxy:
             tool_names=tool_names,
             tool_name_registry={},
             tool_enabled=False,
+            chat_type=model_mode.chat_type,
+            thinking_enabled=True if model_mode.force_thinking else None,
+            force_thinking=model_mode.force_thinking,
+            enable_search=model_mode.chat_type == "deep_research",
+            model_mode=model_mode.mode,
+            skip_prewarmed_chat_ids=model_mode.chat_type != "t2t",
         )
 
     @staticmethod
@@ -160,6 +190,7 @@ class CLIProxy:
         Returns:
             dict: OpenAI 格式的响应
         """
+        visible_text = sanitize_visible_text(execution.state.answer_text)
         return {
             "id": f"chatcmpl-{execution.chat_id[:12]}",
             "object": "chat.completion",
@@ -170,15 +201,15 @@ class CLIProxy:
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": execution.state.answer_text,
+                        "content": visible_text,
                     },
                     "finish_reason": "stop",
                 }
             ],
             "usage": {
                 "prompt_tokens": len(standard_request.prompt),
-                "completion_tokens": len(execution.state.answer_text),
-                "total_tokens": len(standard_request.prompt) + len(execution.state.answer_text),
+                "completion_tokens": len(visible_text),
+                "total_tokens": len(standard_request.prompt) + len(visible_text),
             },
         }
 
@@ -196,14 +227,23 @@ class CLIProxy:
         Returns:
             dict: Claude 格式的响应
         """
+        from backend.runtime.execution import tool_directive_visible_text
+
         content_blocks: list[dict] = []
 
         # 添加思考内容
         if execution.state.reasoning_text:
-            content_blocks.append({"type": "thinking", "thinking": execution.state.reasoning_text})
+            content_blocks.append({"type": "thinking", "thinking": sanitize_visible_text(execution.state.reasoning_text)})
 
         # 添加工具调用块
-        content_blocks.extend(directive.tool_blocks)
+        content_blocks.extend(sanitize_visible_text_blocks(directive.tool_blocks))
+        visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+        if (
+            directive.stop_reason != "tool_use"
+            and visible_text
+            and not any(block.get("type") == "text" for block in content_blocks)
+        ):
+            content_blocks.append({"type": "text", "text": visible_text})
 
         return {
             "id": msg_id,
@@ -215,7 +255,7 @@ class CLIProxy:
             "stop_sequence": None,
             "usage": {
                 "input_tokens": len(standard_request.prompt),
-                "output_tokens": len(execution.state.answer_text),
+                "output_tokens": len(visible_text),
             },
         }
 
@@ -231,11 +271,12 @@ class CLIProxy:
         Returns:
             dict: Gemini 格式的响应
         """
+        visible_text = sanitize_visible_text(execution.state.answer_text)
         return {
             "candidates": [
                 {
                     "content": {
-                        "parts": [{"text": execution.state.answer_text}],
+                        "parts": [{"text": visible_text}],
                         "role": "model",
                     },
                     "finishReason": "STOP",
@@ -244,8 +285,8 @@ class CLIProxy:
             ],
             "usageMetadata": {
                 "promptTokenCount": len(standard_request.prompt),
-                "candidatesTokenCount": len(execution.state.answer_text),
-                "totalTokenCount": len(standard_request.prompt) + len(execution.state.answer_text),
+                "candidatesTokenCount": len(visible_text),
+                "totalTokenCount": len(standard_request.prompt) + len(visible_text),
             },
         }
 

@@ -16,6 +16,7 @@ _REQUEST_DEFAULTS: dict[str, Any] = {
     "chat_id": "-",
     "stream_attempt": "-",
     "upstream_attempt": "-",
+    "test_marker": "-",
 }
 
 _LOG_FORMAT = (
@@ -45,12 +46,15 @@ class SafeRequestFormatter(logging.Formatter):
 def configure_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
+    simplified_filter = None
 
     # 应用精简日志过滤器
     try:
         from backend.core.log_filter import SimplifiedLogFilter
-        if not any(isinstance(f, SimplifiedLogFilter) for f in root.filters):
-            root.addFilter(SimplifiedLogFilter())
+        simplified_filter = next((f for f in root.filters if isinstance(f, SimplifiedLogFilter)), None)
+        if simplified_filter is None:
+            simplified_filter = SimplifiedLogFilter()
+            root.addFilter(simplified_filter)
     except ImportError:
         pass
 
@@ -60,12 +64,19 @@ def configure_logging(level: int = logging.INFO) -> None:
         handler = logging.StreamHandler()
         handler.setLevel(level)
         handler.setFormatter(formatter)
+        if simplified_filter is not None:
+            handler.addFilter(simplified_filter)
         root.addHandler(handler)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         return
 
     for handler in root.handlers:
         handler.setLevel(level)
         handler.setFormatter(formatter)
+        if simplified_filter is not None and not any(isinstance(f, type(simplified_filter)) for f in handler.filters):
+            handler.addFilter(simplified_filter)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def new_request_id() -> str:

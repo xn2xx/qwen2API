@@ -1,9 +1,19 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { Button } from "../components/ui/button"
-import { Send, RefreshCw, Bot } from "lucide-react"
+import { Send, RefreshCw, Bot, Brain, Zap } from "lucide-react"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
+import {
+  FALLBACK_CHAT_MODELS,
+  chooseDefaultModel,
+  fetchModelOptions,
+  filterTextTestModels,
+  formatModelOptionLabel,
+  groupModelOptions,
+  isThinkingVariant,
+  type ModelOption,
+} from "../lib/models"
 
 // 渲染消息内容：自动把 Markdown 图片和图片 URL 渲染成 <img>
 function MessageContent({ content }: { content: string }) {
@@ -19,7 +29,7 @@ function MessageContent({ content }: { content: string }) {
     return <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
   }
 
-  const nodes: JSX.Element[] = []
+  const nodes: ReactNode[] = []
   let cursor = 0
   segs.forEach((seg, i) => {
     if (seg.start > cursor) {
@@ -45,43 +55,191 @@ function MessageContent({ content }: { content: string }) {
   return <div className="whitespace-pre-wrap leading-relaxed">{nodes}</div>
 }
 
+type ChatMessage = { role: string; content: string; reasoning?: string; error?: boolean }
+const TYPEWRITER_CHUNK_SIZE = 2
+const TYPEWRITER_DELAY_MS = 24
+
+function asText(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {}
+}
+
+function extractTextFromContent(content: unknown): string {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map(part => {
+      const block = asRecord(part)
+      const type = asText(block.type)
+      if (type === "thinking" || type === "reasoning" || type === "reasoning_text") {
+        return ""
+      }
+      if (type === "text" || type === "output_text" || type === "message") {
+        return asText(block.text) || asText(block.content)
+      }
+      return asText(block.text) || asText(block.content)
+    })
+    .join("")
+}
+
+function readReasoningFields(value: unknown): string {
+  const record = asRecord(value)
+  const extra = asRecord(record.extra)
+  return (
+    asText(record.reasoning_content) ||
+    asText(record.reasoning) ||
+    asText(record.reasoning_text) ||
+    asText(record.thinking) ||
+    asText(record.thoughts) ||
+    asText(extra.reasoning_content) ||
+    asText(extra.reasoning) ||
+    asText(extra.reasoning_text) ||
+    asText(extra.thinking) ||
+    asText(extra.thoughts)
+  )
+}
+
+function splitInlineThinking(content: string, reasoning = ""): { content: string; reasoning: string } {
+  if (!content || !/<think[\s>]/i.test(content)) return { content, reasoning }
+  let visible = ""
+  let thoughts = reasoning
+  let cursor = 0
+  for (const match of content.matchAll(/<think[^>]*>([\s\S]*?)<\/think>/gi)) {
+    visible += content.slice(cursor, match.index)
+    thoughts += match[1] || ""
+    cursor = (match.index ?? 0) + match[0].length
+  }
+  visible += content.slice(cursor)
+  return { content: visible, reasoning: thoughts }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
+}
+
+function extractReasoningFromContent(content: unknown): string {
+  if (!Array.isArray(content)) return ""
+  return content
+    .map(part => {
+      const block = asRecord(part)
+      const type = block.type
+      if (type === "thinking") return asText(block.thinking)
+      if (type === "reasoning_text") return asText(block.text)
+      if (type === "reasoning") return asText(block.text) || asText(block.reasoning)
+      return readReasoningFields(block)
+    })
+    .join("")
+}
+
+function normalizeAssistantMessage(message: unknown): ChatMessage {
+  const msg = asRecord(message)
+  const inline = splitInlineThinking(extractTextFromContent(msg.content), readReasoningFields(msg) || extractReasoningFromContent(msg.content))
+  return {
+    role: asText(msg.role) || "assistant",
+    content: inline.content,
+    ...(inline.reasoning ? { reasoning: inline.reasoning } : {}),
+  }
+}
+
+function extractStreamDelta(payload: unknown): { content: string; reasoning: string } {
+  const data = asRecord(payload)
+  const responseEventType = asText(data.type)
+  if (responseEventType === "response.reasoning_text.delta") {
+    return { content: "", reasoning: asText(data.delta) }
+  }
+  if (responseEventType === "response.output_text.delta") {
+    return splitInlineThinking(asText(data.delta))
+  }
+
+  const choices = Array.isArray(data.choices) ? data.choices : []
+  const choice = asRecord(choices[0])
+  const delta = asRecord(choice.delta)
+  const message = asRecord(choice.message)
+  const content = extractTextFromContent(delta.content) || extractTextFromContent(message.content) || extractTextFromContent(data.content)
+  const reasoning = readReasoningFields(delta) || readReasoningFields(message) || readReasoningFields(data) || extractReasoningFromContent(delta.content) || extractReasoningFromContent(message.content)
+  return splitInlineThinking(content, reasoning)
+}
+
 export default function TestPage() {
-  const [messages, setMessages] = useState<{ role: string; content: string; reasoning?: string; error?: boolean }[]>([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
   const [model, setModel] = useState("qwen3.6-plus")
-  const [availableModels, setAvailableModels] = useState<string[]>(["qwen3.6-plus"])
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>(FALLBACK_CHAT_MODELS)
   const [stream, setStream] = useState(true)
+  const [answerMode, setAnswerMode] = useState<"thinking" | "fast">("thinking")
   const bottomRef = useRef<HTMLDivElement>(null)
+  const groupedModels = groupModelOptions(availableModels)
+  const selectedForcesThinking = isThinkingVariant(model)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages])
 
-  // 挂载时从 /v1/models 拉真实模型列表，失败回退到默认三项
+  // 接口测试只展示文本类模型，图片/视频等生成模型分流到独立页面。
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch(`${API_BASE}/v1/models`, { headers: getAuthHeader() })
-        if (!r.ok) return
-        const j = await r.json()
-        const ids = (j?.data || [])
-          .map((m: { id?: string }) => m?.id)
-          .filter((id: unknown): id is string => typeof id === "string" && !!id)
-        if (ids.length) {
-          setAvailableModels(ids)
-          if (!ids.includes(model)) setModel(ids[0])
+        const options = filterTextTestModels(await fetchModelOptions())
+        if (options.length) {
+          setAvailableModels(options)
+          setModel(current => chooseDefaultModel(options, current))
         }
       } catch {
         // keep fallback list
       }
     })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const appendAssistantDelta = (content: string, reasoning: string) => {
+    if (!content && !reasoning) return
+    setMessages(prev => {
+      const msgs = [...prev]
+      const last = msgs[msgs.length - 1] ?? { role: "assistant", content: "" }
+      msgs[msgs.length - 1] = {
+        ...last,
+        content: (last.content || "") + content,
+        reasoning: (last.reasoning || "") + reasoning,
+      }
+      return msgs
+    })
+  }
+
+  const appendAssistantTypewriter = async (message: ChatMessage) => {
+    setMessages(prev => [...prev, { role: "assistant", content: "" }])
+    let pendingReasoning = message.reasoning || ""
+    let pendingContent = message.content || ""
+    while (pendingReasoning || pendingContent) {
+      if (pendingReasoning) {
+        const chunk = pendingReasoning.slice(0, TYPEWRITER_CHUNK_SIZE)
+        pendingReasoning = pendingReasoning.slice(chunk.length)
+        appendAssistantDelta("", chunk)
+      } else {
+        const chunk = pendingContent.slice(0, TYPEWRITER_CHUNK_SIZE)
+        pendingContent = pendingContent.slice(chunk.length)
+        appendAssistantDelta(chunk, "")
+      }
+      await sleep(TYPEWRITER_DELAY_MS)
+    }
+  }
 
   const handleSend = async () => {
     if (!input.trim() || loading) return
     const userMsg = { role: "user", content: input }
+    const wantsThinking = answerMode === "thinking"
+    const requestBody = {
+      model,
+      messages: [...messages, userMsg],
+      stream,
+      include_reasoning: wantsThinking,
+      enable_thinking: wantsThinking,
+    }
+    if (!wantsThinking && selectedForcesThinking) {
+      toast.info("该模型为强制思考变体，快速模式不会生效")
+    }
     setMessages(prev => [...prev, userMsg])
     setInput("")
     setLoading(true)
@@ -91,13 +249,13 @@ export default function TestPage() {
         const res = await fetch(`${API_BASE}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
-          body: JSON.stringify({ model, messages: [...messages, userMsg], stream: false })
+          body: JSON.stringify({ ...requestBody, stream: false })
         })
         const data = await res.json()
         if (data.error) {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ ${data.error}`, error: true }])
         } else if (data.choices?.[0]) {
-          setMessages(prev => [...prev, data.choices[0].message])
+          await appendAssistantTypewriter(normalizeAssistantMessage(data.choices[0].message))
         } else {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ 未知响应: ${JSON.stringify(data)}`, error: true }])
         }
@@ -105,7 +263,7 @@ export default function TestPage() {
         const res = await fetch(`${API_BASE}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
-          body: JSON.stringify({ model, messages: [...messages, userMsg], stream: true })
+          body: JSON.stringify({ ...requestBody, stream: true })
         })
 
         if (!res.ok) {
@@ -120,46 +278,126 @@ export default function TestPage() {
         const reader = res.body.getReader()
         const decoder = new TextDecoder()
         let hasContent = false
+        let hasTerminalError = false
+        const outputQueue = { content: "", reasoning: "" }
+        let typewriterRunning = false
+
+        const runTypewriter = async () => {
+          if (typewriterRunning) return
+          typewriterRunning = true
+          try {
+            while (outputQueue.reasoning || outputQueue.content) {
+              if (outputQueue.reasoning) {
+                const chunk = outputQueue.reasoning.slice(0, TYPEWRITER_CHUNK_SIZE)
+                outputQueue.reasoning = outputQueue.reasoning.slice(chunk.length)
+                appendAssistantDelta("", chunk)
+              } else {
+                const chunk = outputQueue.content.slice(0, TYPEWRITER_CHUNK_SIZE)
+                outputQueue.content = outputQueue.content.slice(chunk.length)
+                appendAssistantDelta(chunk, "")
+              }
+              await sleep(TYPEWRITER_DELAY_MS)
+            }
+          } finally {
+            typewriterRunning = false
+            if (outputQueue.reasoning || outputQueue.content) void runTypewriter()
+          }
+        }
+
+        const enqueueAssistantDelta = (content: string, reasoning: string) => {
+          if (!content && !reasoning) return
+          hasContent = true
+          outputQueue.content += content
+          outputQueue.reasoning += reasoning
+          void runTypewriter()
+        }
+
+        const waitForTypewriter = async () => {
+          while (typewriterRunning || outputQueue.reasoning || outputQueue.content) {
+            await sleep(20)
+          }
+        }
+
+        let currentEventData = ""
+
+        const processSsePayload = (payload: string) => {
+          const trimmedPayload = payload.trim()
+          if (!trimmedPayload || trimmedPayload === "[DONE]") return
+
+          try {
+            const data = JSON.parse(trimmedPayload)
+            if (data.error) {
+              outputQueue.content = ""
+              outputQueue.reasoning = ""
+              setMessages(prev => {
+                const msgs = [...prev]
+                msgs[msgs.length - 1] = { role: "assistant", content: `❌ ${data.error}`, error: true }
+                return msgs
+              })
+              hasContent = true
+              hasTerminalError = true
+              return
+            }
+            const { content, reasoning } = extractStreamDelta(data)
+            enqueueAssistantDelta(content, reasoning)
+          } catch {
+            // Keep the test page resilient to malformed payloads without aborting the stream.
+          }
+        }
+
+        let buffer = ""
+
+        const dispatchSseEvent = () => {
+          if (!currentEventData) return
+          const payload = currentEventData
+          currentEventData = ""
+          processSsePayload(payload)
+        }
+
+        const processSseLine = (rawLine: string) => {
+          const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine
+          if (line === "") {
+            dispatchSseEvent()
+            return
+          }
+          if (line.startsWith(":")) return
+          if (!line.startsWith("data:")) return
+
+          const data = line.startsWith("data: ") ? line.slice(6) : line.slice(5)
+          currentEventData += currentEventData ? `\n${data}` : data
+        }
+
+        const processSseChunk = (chunk: string) => {
+          if (!chunk) return
+          buffer += chunk
+          const lines = buffer.split("\n")
+          buffer = lines.pop() ?? ""
+          for (const line of lines) {
+            processSseLine(line)
+            if (hasTerminalError) break
+          }
+        }
 
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
 
-          const chunk = decoder.decode(value, { stream: true })
-          for (const rawLine of chunk.split("\n")) {
-            const line = rawLine.trim()
-            if (!line || line.startsWith(":") || line === "data: [DONE]") continue
-            if (line.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(line.slice(6))
-                if (data.error) {
-                  setMessages(prev => {
-                    const msgs = [...prev]
-                    msgs[msgs.length - 1] = { role: "assistant", content: `❌ ${data.error}`, error: true }
-                    return msgs
-                  })
-                  hasContent = true
-                  break
-                }
-                const content: string = data.choices?.[0]?.delta?.content ?? ""
-                const reasoning: string = data.choices?.[0]?.delta?.reasoning_content ?? ""
-                if (content || reasoning) {
-                  hasContent = true
-                  setMessages(prev => {
-                    const msgs = [...prev]
-                    const last = msgs[msgs.length - 1]
-                    msgs[msgs.length - 1] = {
-                      ...last,
-                      content: last.content + content,
-                      reasoning: (last.reasoning || "") + reasoning,
-                    }
-                    return msgs
-                  })
-                }
-              } catch (_) { /* skip */ }
-            }
-          }
+          processSseChunk(decoder.decode(value, { stream: true }))
+          if (hasTerminalError) break
         }
+
+        if (!hasTerminalError) {
+          processSseChunk(decoder.decode())
+          if (buffer) {
+            processSseLine(buffer)
+            buffer = ""
+          }
+          dispatchSseEvent()
+        } else {
+          decoder.decode()
+        }
+
+        await waitForTypewriter()
 
         if (!hasContent) {
           setMessages(prev => {
@@ -169,9 +407,10 @@ export default function TestPage() {
           })
         }
       }
-    } catch (err: any) {
-      toast.error(`网络错误: ${err.message}`)
-      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${err.message}`, error: true }])
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "未知错误"
+      toast.error(`网络错误: ${message}`)
+      setMessages(prev => [...prev, { role: "assistant", content: `❌ 网络错误: ${message}`, error: true }])
     } finally {
       setLoading(false)
     }
@@ -179,31 +418,66 @@ export default function TestPage() {
 
   return (
     <div className="flex flex-col h-[calc(100vh-10rem)] space-y-4 max-w-5xl mx-auto">
-      <div className="flex justify-between items-center">
+      <div className="flex flex-col gap-4 rounded-2xl border bg-card/80 p-4 shadow-sm backdrop-blur md:flex-row md:items-start md:justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">接口测试</h2>
-          <p className="text-muted-foreground">在此测试您的 API 分发是否正常工作。</p>
+          <p className="text-muted-foreground">在此测试 API 分发、模型变体与思考模式是否正常工作。</p>
         </div>
-        <div className="flex gap-4 items-center">
-          <div className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md">
-            <span className="font-medium text-muted-foreground">模型:</span>
-            <select value={model} onChange={e => setModel(e.target.value)} className="bg-transparent font-mono outline-none">
-              {availableModels.map(id => (
-                <option key={id} value={id}>{id}</option>
-              ))}
-            </select>
+        <div className="flex flex-col gap-3 md:items-end">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <div className="flex items-center gap-2 rounded-xl border bg-background/70 px-3 py-2">
+              <span className="font-medium text-muted-foreground">模型</span>
+              <select value={model} onChange={e => setModel(e.target.value)} className="max-w-[19rem] bg-transparent font-mono outline-none">
+                {groupedModels.map(group => (
+                  <optgroup key={group.family} label={group.family}>
+                    {group.models.map(option => (
+                      <option key={option.id} value={option.id}>{formatModelOptionLabel(option)}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+            <div
+              className="flex cursor-pointer items-center gap-2 rounded-xl border bg-background/70 px-3 py-2"
+              onClick={() => setStream(!stream)}
+            >
+              <input type="checkbox" checked={stream} onChange={() => {}} className="cursor-pointer" />
+              <span className="font-medium">流式传输</span>
+            </div>
+            <Button variant="outline" onClick={() => { setMessages([]); setInput("") }}>
+              <RefreshCw className="mr-2 h-4 w-4" /> 新建对话
+            </Button>
           </div>
-          <div
-            className="flex items-center gap-2 text-sm bg-card border px-3 py-1.5 rounded-md cursor-pointer"
-            onClick={() => setStream(!stream)}
-          >
-            <input type="checkbox" checked={stream} onChange={() => {}} className="cursor-pointer" />
-            <span className="font-medium">流式传输 (Stream)</span>
-          </div>
-          <Button variant="outline" onClick={() => setMessages([])}>
-            <RefreshCw className="mr-2 h-4 w-4" /> 清空对话
-          </Button>
         </div>
+      </div>
+
+      <div className="rounded-xl border bg-card/70 p-3 shadow-sm">
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div className="flex rounded-xl border bg-background/70 p-1">
+            <button
+              type="button"
+              onClick={() => setAnswerMode("thinking")}
+              className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${answerMode === "thinking" ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted"}`}
+            >
+              <Brain className="h-4 w-4" /> 思考
+            </button>
+            <button
+              type="button"
+              onClick={() => setAnswerMode("fast")}
+              className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${answerMode === "fast" ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted"}`}
+            >
+              <Zap className="h-4 w-4" /> 快速
+            </button>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {answerMode === "thinking"
+              ? "思考模式会向后端发送 enable_thinking=true，优先展示 reasoning。"
+              : "快速模式会向后端发送 enable_thinking=false，减少思考阶段等待。"}
+          </p>
+        </div>
+        {selectedForcesThinking && answerMode === "fast" ? (
+          <p className="mt-2 text-xs text-amber-500">该模型为强制思考变体，快速模式不会覆盖后端强制 thinking。</p>
+        ) : null}
       </div>
 
       <div className="flex-1 rounded-xl border bg-card overflow-hidden flex flex-col shadow-sm">

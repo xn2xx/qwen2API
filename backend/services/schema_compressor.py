@@ -61,7 +61,7 @@ def _type_of(prop: dict[str, Any]) -> str:
     return str(base_type) if base_type else "any"
 
 
-def compact_schema(schema: dict[str, Any]) -> str:
+def compact_schema(schema: dict[str, Any], max_chars: int | None = None) -> str:
     """压缩一个 JSON Schema 为 TS-like 签名。
 
     返回示例：`{file_path!: string, encoding?: utf-8|base64}`
@@ -77,7 +77,10 @@ def compact_schema(schema: dict[str, Any]) -> str:
         type_str = _type_of(spec if isinstance(spec, dict) else {})
         marker = "!" if name in required else "?"
         parts.append(f"{name}{marker}: {type_str}")
-    return "{" + ", ".join(parts) + "}"
+    result = "{" + ", ".join(parts) + "}"
+    if max_chars and len(result) > max_chars:
+        result = result[:max_chars] + "…}"
+    return result
 
 
 def render_tool_signature(tool: dict[str, Any], desc_max_len: int = 50) -> str:

@@ -1,28 +1,30 @@
 services:
   qwen2api:
-    image: yujunzhixue/qwen2api:latest
+    image: ${QWEN2API_IMAGE:-yujunzhixue/qwen2api:latest}
     container_name: qwen2api
     restart: unless-stopped
+    init: true
     env_file:
       - path: .env
         required: false
     ports:
-      - "7860:7860"
+      - "${HOST_PORT:-7860}:7860"
     volumes:
       - ./data:/workspace/data
       - ./logs:/workspace/logs
-    shm_size: "256m"
+    shm_size: "512m"
     environment:
       PYTHONIOENCODING: utf-8
       PORT: "7860"
       WORKERS: "1"
       LOG_LEVEL: "INFO"
-      MAX_INFLIGHT: "2"
+      BROWSER_POOL_SIZE: "1"
+      MAX_INFLIGHT_PER_ACCOUNT: "2"
       ACCOUNT_MIN_INTERVAL_MS: "0"
       REQUEST_JITTER_MIN_MS: "0"
       REQUEST_JITTER_MAX_MS: "0"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:7860/healthz || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/healthz || exit 1"]
       interval: 30s
       timeout: 10s
       start_period: 120s

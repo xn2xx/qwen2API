@@ -26,6 +26,11 @@ class StandardRequest:
     attachments: list[NormalizedAttachment] = field(default_factory=list)
     uploaded_file_ids: list[str] = field(default_factory=list)
     upstream_files: list[dict[str, Any]] = field(default_factory=list)
+    chat_type: str = "t2t"
+    thinking_enabled: bool | None = None
+    force_thinking: bool = False
+    enable_search: bool = False
+    model_mode: str = "chat"
     session_key: str | None = None
     context_mode: str = "inline"
     bound_account_email: str | None = None
@@ -36,3 +41,7 @@ class StandardRequest:
     persistent_session: bool = False
     session_message_hashes: list[str] = field(default_factory=list)
     session_chat_invalidated: bool = False
+    workspace_root: str | None = None
+    retry_blocked_tools: list[str] = field(default_factory=list)
+    retry_read_blocklist: list[str] = field(default_factory=list)
+    skip_prewarmed_chat_ids: bool = False

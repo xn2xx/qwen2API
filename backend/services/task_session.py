@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
+from backend.runtime.execution import tool_directive_visible_text
+from backend.runtime.visible_text import sanitize_visible_text_blocks
 from backend.services.prompt_builder import _extract_text, _extract_user_text_only, _render_history_tool_call
 
 log = logging.getLogger("qwen2api.task_session")
@@ -184,17 +186,21 @@ def build_continuation_prompt(
         'Earlier context already exists in the conversation history of this chat.',
         'Process ONLY the new items below and continue the task from there.',
         '',
-        'CRITICAL TOOL CALL FORMAT - MUST USE ##TOOL_CALL## MARKERS:',
-        '##TOOL_CALL##',
-        '{"name": "EXACT_TOOL_NAME", "input": {"param": "value"}}',
-        '##END_CALL##',
+        'CRITICAL TOOL CALL FORMAT - MUST USE QNML MARKERS:',
+        '<|QNML|tool_calls>',
+        '  <|QNML|invoke name="EXACT_TOOL_NAME">',
+        '    <|QNML|parameter name="param"><![CDATA[value]]></|QNML|parameter>',
+        '  </|QNML|invoke>',
+        '</|QNML|tool_calls>',
         '',
         '=== AVAILABLE TOOLS ===',
         tool_definitions,
         '',
         'EXECUTION RULES:',
-        '- When you need to call a tool, output EXACTLY the ##TOOL_CALL##...##END_CALL## format above',
-        '- NO other format will work - pure JSON without markers will be INTERCEPTED',
+        '- When you need to call a tool, output EXACTLY the QNML format above',
+        '- Put one or more <|QNML|invoke> entries inside a single <|QNML|tool_calls> wrapper',
+        '- Use <|QNML|parameter name="ARG"><![CDATA[value]]></|QNML|parameter> for every argument',
+        '- Pure JSON or legacy hash markers are compatibility only and should not be used',
         '- If you just received a tool result, use it to continue the task immediately',
         '- Do NOT call Agent, AskUserQuestion, EnterPlanMode, ExitPlanMode, EnterWorktree, ExitWorktree',
         '- Do NOT ask questions or wait - execute the task directly',
@@ -332,9 +338,10 @@ def build_anthropic_assistant_history_message(*, execution, request: StandardReq
     for block in directive.tool_blocks:
         if block.get('type') == 'thinking':
             continue
-        content_blocks.append(block)
-    if directive.stop_reason != 'tool_use' and execution.state.answer_text and not content_blocks:
-        content_blocks.append({"type": "text", "text": execution.state.answer_text})
+        content_blocks.extend(sanitize_visible_text_blocks([block]))
+    visible_text = tool_directive_visible_text(directive, execution.state.answer_text)
+    if directive.stop_reason != 'tool_use' and visible_text and not content_blocks:
+        content_blocks.append({"type": "text", "text": visible_text})
     return {"role": "assistant", "content": content_blocks}
 
 
@@ -354,7 +361,7 @@ def build_openai_assistant_history_message(*, execution, request: StandardReques
             if block.get('type') == 'tool_use'
         ]
         return {'role': 'assistant', 'content': None, 'tool_calls': tool_calls}
-    return {'role': 'assistant', 'content': execution.state.answer_text}
+    return {'role': 'assistant', 'content': tool_directive_visible_text(directive, execution.state.answer_text)}
 
 
 def extend_hashes_with_assistant(*, current_hashes: list[str], assistant_message: dict[str, Any], request: StandardRequest) -> list[str]:

@@ -771,31 +771,37 @@ class AuthResolver:
 
     async def refresh_token(self, acc: Account) -> bool:
 
-        """Re-login with email+password to get a fresh token. Returns True on success."""
+        """Re-login on chat.qwen.ai with email+password and persist a verified token."""
         if not acc.email or not acc.password:
             log.warning(f"[Refresh] 账号 {acc.email} 无密码，无法刷新")
             return False
-            
-        log.info(f"[Refresh] 正在为 {acc.email} 刷新 token...")
+
+        log.info(f"[Refresh] 正在打开官网为 {acc.email} 刷新 token...")
         try:
             async with _new_browser() as browser:
                 page = await browser.new_page()
-                new_token = await _login_and_get_token(page, acc.email, acc.password, timeout_sec=20)
-                if new_token and new_token != acc.token:
-                    old_prefix = acc.token[:20] if acc.token else "空"
-                    acc.token = new_token
-                    acc.valid = True
-                    await self.pool.save()
-                    log.info(f"[Refresh] {acc.email} token 已更新 ({old_prefix}... → {new_token[:20]}...)")
-                    return True
-                elif new_token == acc.token:
-                    # Token same but might still be valid — mark valid again
-                    acc.valid = True
-                    log.info(f"[Refresh] {acc.email} token 未变化，重新标记有效")
-                    return True
-                else:
-                    log.warning(f"[Refresh] {acc.email} 登录后未获取到token，URL={page.url}")
+                old_token = acc.token or ""
+                new_token = await _login_and_get_token(page, acc.email, acc.password, timeout_sec=30)
+                if not new_token:
+                    log.warning(f"[Refresh] {acc.email} 登录后未获取到 token，URL={page.url}")
                     return False
+
+                if not await _verify_qwen_token(new_token):
+                    log.warning(f"[Refresh] {acc.email} 登录拿到 token，但官网复验未通过，URL={page.url}")
+                    return False
+
+                old_prefix = old_token[:20] if old_token else "空"
+                acc.token = new_token
+                acc.valid = True
+                acc.activation_pending = False
+                acc.status_code = "valid"
+                acc.last_error = "Token 已通过官网登录刷新"
+                await self.pool.save()
+                if new_token != old_token:
+                    log.info(f"[Refresh] {acc.email} token 已更新 ({old_prefix}... → {new_token[:20]}...)")
+                else:
+                    log.info(f"[Refresh] {acc.email} token 未变化，但官网复验通过")
+                return True
         except Exception as e:
             log.error(f"[Refresh] {acc.email} 刷新异常: {e}")
             return False

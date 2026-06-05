@@ -4,6 +4,29 @@ import logging
 log = logging.getLogger("qwen2api.sse")
 
 
+def _first_text(*values) -> str:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _extract_reasoning(delta: dict) -> str:
+    extra = delta.get("extra") if isinstance(delta.get("extra"), dict) else {}
+    return _first_text(
+        delta.get("reasoning_content"),
+        delta.get("reasoning"),
+        delta.get("reasoning_text"),
+        delta.get("thinking"),
+        delta.get("thoughts"),
+        extra.get("reasoning_content"),
+        extra.get("reasoning"),
+        extra.get("reasoning_text"),
+        extra.get("thinking"),
+        extra.get("thoughts"),
+    )
+
+
 def parse_sse_chunk(chunk: str) -> list[dict]:
     events = []
     for line in chunk.splitlines():
@@ -23,7 +46,12 @@ def parse_sse_chunk(chunk: str) -> list[dict]:
     for evt in events:
         if evt.get("choices"):
             delta = evt["choices"][0].get("delta", {})
+            phase = delta.get("phase", "answer")
             content = delta.get("content", "")
+            reasoning = _extract_reasoning(delta)
+            if reasoning:
+                content = reasoning
+                phase = "thinking_summary" if phase == "answer" else phase
 
             # Log if content contains "Tool" and "does not exist"
             if content and "Tool" in content and "does not exist" in content:
@@ -32,7 +60,7 @@ def parse_sse_chunk(chunk: str) -> list[dict]:
             parsed.append(
                 {
                     "type": "delta",
-                    "phase": delta.get("phase", "answer"),
+                    "phase": phase,
                     "content": content,
                     "status": delta.get("status", ""),
                     "extra": delta.get("extra", {}),

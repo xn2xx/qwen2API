@@ -67,3 +67,5 @@ test_*.py
 .dockerignore
 Dockerfile*
 docker-compose*.yml
+**/*.tsbuildinfo
+frontend/node_modules/.tmp/

@@ -1,6 +1,7 @@
 import os
 import json
 from pathlib import Path
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 from typing import Dict, Set
 
@@ -15,7 +16,10 @@ class Settings(BaseSettings):
 
     # 并发配置（浏览器仅用于账号注册，不用于对话请求）
     BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 1))
-    MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 2))
+    MAX_INFLIGHT_PER_ACCOUNT: int = Field(
+        default=2,
+        validation_alias=AliasChoices("MAX_INFLIGHT_PER_ACCOUNT", "MAX_INFLIGHT"),
+    )
     BROWSER_STREAM_TIMEOUT_SECONDS: int = int(os.getenv("BROWSER_STREAM_TIMEOUT_SECONDS", 1800))
 
     # 容灾与限流
@@ -26,6 +30,16 @@ class Settings(BaseSettings):
     REQUEST_JITTER_MAX_MS: int = int(os.getenv("REQUEST_JITTER_MAX_MS", 0))
     RATE_LIMIT_BASE_COOLDOWN: int = int(os.getenv("RATE_LIMIT_BASE_COOLDOWN", 600))
     RATE_LIMIT_MAX_COOLDOWN: int = int(os.getenv("RATE_LIMIT_MAX_COOLDOWN", 3600))
+    ACCOUNT_READY_SET_THRESHOLD: int = int(os.getenv("ACCOUNT_READY_SET_THRESHOLD", 128))
+
+    # 上游 chat 生命周期：默认每次请求结束后删除 Qwen 会话，删除失败有限重试。
+    CHAT_DELETE_RETRY_ATTEMPTS: int = int(os.getenv("CHAT_DELETE_RETRY_ATTEMPTS", 3))
+    CHAT_DELETE_RETRY_DELAY_SECONDS: float = float(os.getenv("CHAT_DELETE_RETRY_DELAY_SECONDS", 0.5))
+    CHAT_ID_PREWARM_TARGET_PER_ACCOUNT: int = int(os.getenv("CHAT_ID_PREWARM_TARGET_PER_ACCOUNT", 5))
+    CHAT_ID_PREWARM_TTL_SECONDS: int = int(os.getenv("CHAT_ID_PREWARM_TTL_SECONDS", 120))
+    CHAT_ID_PREWARM_MAX_CONCURRENCY: int = int(os.getenv("CHAT_ID_PREWARM_MAX_CONCURRENCY", 16))
+    TRACE_RESPONSE_FINGERPRINTS: bool = os.getenv("TRACE_RESPONSE_FINGERPRINTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    TRACE_RESPONSE_TAIL_CHARS: int = int(os.getenv("TRACE_RESPONSE_TAIL_CHARS", 160))
 
     # 日志
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
@@ -50,6 +64,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 API_KEYS_FILE = DATA_DIR / "api_keys.json"
 

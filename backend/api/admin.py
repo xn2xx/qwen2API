@@ -187,27 +187,25 @@ async def register_new_account(request: Request):
 
 @router.post("/verify", dependencies=[Depends(verify_admin)])
 async def verify_all_accounts(request: Request):
-    """验证所有账号的有效性 (完全复原单文件逻辑)"""
+    """逐个到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
     from backend.core.account_pool import AccountPool
     from backend.services.qwen_client import QwenClient
-    import logging
 
-    log = logging.getLogger("qwen2api.admin")
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
     results = []
     for acc in pool.accounts:
-        is_valid = await client.verify_token(acc.token)
-        if not is_valid and acc.password:
-            log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
-            is_valid = await client.auth_resolver.refresh_token(acc)
+        results.append(await client.verify_account(acc))
 
-        acc.valid = is_valid
-        results.append({"email": acc.email, "valid": is_valid, "refreshed": not is_valid})
-
-    await pool.save() # 直接保存全部状态，不调用 mark_invalid 以免熔断影响测试
-    return {"ok": True, "results": results}
+    summary = {
+        "total": len(results),
+        "valid": sum(1 for item in results if item.get("valid")),
+        "refreshed": sum(1 for item in results if item.get("refreshed")),
+        "banned": sum(1 for item in results if item.get("status_code") == "banned"),
+        "failed": sum(1 for item in results if not item.get("valid")),
+    }
+    return {"ok": True, "results": results, "summary": summary, "concurrency": 1}
 
 @router.post("/accounts/{email}/activate", dependencies=[Depends(verify_admin)])
 async def activate_account(email: str, request: Request):
@@ -238,12 +236,10 @@ async def activate_account(email: str, request: Request):
 
 @router.post("/accounts/{email}/verify", dependencies=[Depends(verify_admin)])
 async def verify_account(email: str, request: Request):
-    """单独验证某个账号的有效性 (完全复原单文件逻辑)"""
+    """单独到 chat.qwen.ai 官网验证账号；token 失效时自动刷新。"""
     from backend.services.qwen_client import QwenClient
     from backend.core.account_pool import AccountPool
-    import logging
 
-    log = logging.getLogger("qwen2api.admin")
     pool: AccountPool = request.app.state.account_pool
     client: QwenClient = request.app.state.qwen_client
 
@@ -251,15 +247,7 @@ async def verify_account(email: str, request: Request):
     if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    is_valid = await client.verify_token(acc.token)
-    if not is_valid and acc.password:
-        log.info(f"[校验] {acc.email} token失效，尝试自动刷新...")
-        is_valid = await client.auth_resolver.refresh_token(acc)
-
-    acc.valid = is_valid
-    await pool.save() # 直接保存，不调用 mark_invalid 以免熔断影响正常测试
-
-    return {"email": acc.email, "valid": is_valid}
+    return await client.verify_account(acc)
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):
@@ -281,8 +269,11 @@ async def get_settings(request: Request):
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
         "global_max_inflight": getattr(acc_pool, "global_max_inflight", 0),
         "max_queue_size": getattr(acc_pool, "max_queue_size", 0),
+        "account_ready_set_threshold": backend_settings.ACCOUNT_READY_SET_THRESHOLD,
+        "account_ready_set_enabled": getattr(acc_pool, "ready_set_enabled", False),
         "chat_id_pool_target": pool.target if pool else 0,
         "chat_id_pool_ttl_seconds": pool.ttl if pool else 0,
+        "chat_id_pool_max_concurrency": pool.max_concurrency if pool else 0,
         "model_aliases": safe_map,
     }
 
@@ -298,6 +289,15 @@ async def update_settings(data: dict, request: Request):
                 pool.set_max_inflight(val)
         except (TypeError, ValueError):
             pass
+    if "account_ready_set_threshold" in data:
+        try:
+            val = max(1, int(data["account_ready_set_threshold"]))
+            settings.ACCOUNT_READY_SET_THRESHOLD = val
+            pool = getattr(request.app.state, "account_pool", None)
+            if pool is not None and hasattr(pool, "_reset_concurrency_limits"):
+                pool._reset_concurrency_limits()
+        except (TypeError, ValueError):
+            pass
     if "global_max_inflight" in data:
         try:
             val = int(data["global_max_inflight"])
@@ -306,12 +306,13 @@ async def update_settings(data: dict, request: Request):
                 pool.global_max_inflight = val
         except (TypeError, ValueError):
             pass
-    if "chat_id_pool_target" in data or "chat_id_pool_ttl_seconds" in data:
+    if "chat_id_pool_target" in data or "chat_id_pool_ttl_seconds" in data or "chat_id_pool_max_concurrency" in data:
         cp = getattr(request.app.state, "chat_id_pool", None)
         if cp is not None:
-            cp.update_config(
+            await cp.apply_config(
                 target=data.get("chat_id_pool_target"),
                 ttl_seconds=data.get("chat_id_pool_ttl_seconds"),
+                max_concurrency=data.get("chat_id_pool_max_concurrency"),
             )
     if "model_aliases" in data:
         MODEL_MAP.clear()
